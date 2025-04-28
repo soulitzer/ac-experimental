@@ -4,7 +4,8 @@
 ## Installation
 ```bash
 git clone https://github.com/soulitzer/ac-experimental.git
-pip install ac-experimental
+cd ac-experimental
+pip install -e .
 ```
 
 ## Usage

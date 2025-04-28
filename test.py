@@ -8,7 +8,7 @@ from torch.utils.checkpoint import CheckpointPolicy
 from torch.overrides import TorchFunctionMode
 from torch.testing._internal.two_tensor import TwoTensor
 
-from ac import (
+from ac_experimental import (
     apply_ac_policy,
     SAVE_WITH_HOOKS,
     tag_with_policy
