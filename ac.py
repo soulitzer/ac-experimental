@@ -173,7 +173,8 @@ def _is_compiling(func, args, kwargs):
 class TracerMode(TorchDispatchMode):
     def __init__(self, node_outputs):
         self.node_outputs = node_outputs
-        self._mode_key = torch._C._TorchDispatchModeKey.AC_TRACER
+        if hasattr(torch._C._TorchDispatchModeKey, "AC_TRACER"):
+            self._mode_key = torch._C._TorchDispatchModeKey.AC_TRACER
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if any(t not in [torch._subclasses.FakeTensor, torch.Tensor, torch._subclasses.functional_tensor.FunctionalTensor]
