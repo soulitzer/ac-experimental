@@ -1,19 +1,19 @@
 import contextlib
 import functools
-from typing import NamedTuple
+from typing import Callable, NamedTuple, Union
 
 import torch
-from torch._functorch._aot_autograd.functional_utils import is_fun
 import torch._subclasses.functional_tensor
 import torch.fx.traceback as fx_traceback
-from torch.utils._pytree import tree_map_only
+from torch._functorch._aot_autograd.functional_utils import is_fun
 from torch.utils._python_dispatch import (
     is_traceable_wrapper_subclass,
-    TorchDispatchMode
+    TorchDispatchMode,
 )
-from torch.utils.weak import WeakTensorKeyDictionary
+from torch.utils._pytree import tree_map_only
 
-from torch.utils.checkpoint import CheckpointPolicy, _policy_from_bool
+from torch.utils.checkpoint import _policy_from_bool, CheckpointPolicy
+from torch.utils.weak import WeakTensorKeyDictionary
 
 
 _policy_stack = []
@@ -53,13 +53,13 @@ def is_must_policy(policy):
 
 
 def is_save_policy(policy):
-    return (
-        policy in (CheckpointPolicy.MUST_SAVE, CheckpointPolicy.PREFER_SAVE)
-        or isinstance(policy, SAVE_WITH_HOOKS)
-    )
+    return policy in (
+        CheckpointPolicy.MUST_SAVE,
+        CheckpointPolicy.PREFER_SAVE,
+    ) or isinstance(policy, SAVE_WITH_HOOKS)
 
 
-class SAVE_WITH_HOOKS():
+class SAVE_WITH_HOOKS:
     def __init__(self, pack, unpack):
         self.pack = pack
         self.unpack = unpack
@@ -93,11 +93,9 @@ def current_global_policy(ctx, out, op, *args, **kwargs):
     return current_policy
 
 
-
-
 # Subclass instead of using namedtuple directly so that it's a pytree leaf
 class NodeOutput(NamedTuple):
-    node: 'Node'
+    node: "Node"
     idx: int
 
 
@@ -115,20 +113,33 @@ def incref(node_output):
 
 
 class Node:
-    def __init__(self, func=None, args=None, outs: tuple = None, custom_pack=None, custom_unpack=None, current_fx_meta=None):
+    def __init__(
+        self,
+        func=None,
+        args=None,
+        outs: tuple = None,
+        custom_pack=None,
+        custom_unpack=None,
+        current_fx_meta=None,
+    ):
         self.custom_unpack = custom_unpack if custom_unpack is not None else lambda x: x
         custom_pack = custom_pack if custom_pack is not None else lambda x: x
         self.func = func
         self.args = args
         self.out = None
         self.current_fx_meta = current_fx_meta
-        self.nb_users = dict() # out_idx -> nb_users
+        self.nb_users = dict()  # out_idx -> nb_users
         if outs is not None:
-            self.out = [custom_pack(x) if isinstance(x, torch.Tensor) else x for x in outs]
-
+            self.out = [
+                custom_pack(x) if isinstance(x, torch.Tensor) else x for x in outs
+            ]
 
     def realize_and_decref(self, idx):
-        if self.out is None or (isinstance(self.out, list) and self.out[idx] is None) or (isinstance(self.out, dict) and self.out.get(idx) is None):
+        if (
+            self.out is None
+            or (isinstance(self.out, list) and self.out[idx] is None)
+            or (isinstance(self.out, dict) and self.out.get(idx) is None)
+        ):
             new_args = tree_map_only(NodeOutput, realize_and_decref, self.args)
             raw_out = self.func(*new_args)
             self.out = list(raw_out) if isinstance(raw_out, tuple) else [raw_out]
@@ -138,7 +149,6 @@ class Node:
             self.out[idx] = None
         x_out = self.custom_unpack(out)
         return x_out
-
 
     def incref(self, idx):
         if self.out is None and len(self.nb_users) == 0:
@@ -155,7 +165,7 @@ def get_node_output(node_outputs, t):
     return node_outputs[t]
 
 
-class Context():
+class Context:
     def __init__(self, nodes):
         self.nodes = nodes
 
@@ -170,24 +180,36 @@ def _is_compiling(func, args, kwargs):
     return False
 
 
+# Allow modes to interpose below AC mode for testing
+_tracer_is_infra_mode = True
+
+
 class TracerMode(TorchDispatchMode):
     def __init__(self, node_outputs):
         self.node_outputs = node_outputs
-        if hasattr(torch._C._TorchDispatchModeKey, "AC_TRACER"):
+        if (
+            hasattr(torch._C._TorchDispatchModeKey, "AC_TRACER")
+            and _tracer_is_infra_mode
+        ):
             self._mode_key = torch._C._TorchDispatchModeKey.AC_TRACER
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if any(t not in [torch._subclasses.FakeTensor, torch.Tensor, torch._subclasses.functional_tensor.FunctionalTensor]
-               for t in types):
+        if any(
+            t
+            not in [
+                torch._subclasses.FakeTensor,
+                torch.Tensor,
+                torch._subclasses.functional_tensor.FunctionalTensor,
+            ]
+            for t in types
+        ):
             return NotImplemented
         kwargs = {} if kwargs is None else kwargs
         out = func(*args, **kwargs)
 
         # Non-tensor are always kept alive by the node
         wrapped_args = tree_map_only(
-            torch.Tensor,
-            functools.partial(get_node_output, self.node_outputs),
-            args
+            torch.Tensor, functools.partial(get_node_output, self.node_outputs), args
         )
         # TODO: nodes shouldn't be public API right?
         ctx = Context(self.node_outputs)
@@ -206,8 +228,15 @@ class TracerMode(TorchDispatchMode):
         out_tuple = tuple(out) if isinstance(out, (list, tuple)) else (out,)
         node = (
             Node(
-                func, None, out_tuple, custom_pack, custom_unpack, fx_traceback.current_meta) if (should_save or is_compiling) else
-            Node(func, wrapped_args, None)
+                func,
+                None,
+                out_tuple,
+                custom_pack,
+                custom_unpack,
+                fx_traceback.current_meta,
+            )
+            if (should_save or is_compiling)
+            else Node(func, wrapped_args, None)
         )
         for idx, t in enumerate(out_tuple):
             if isinstance(t, torch.Tensor):
@@ -228,15 +257,14 @@ def flatten(t, pack, unpack):
     outer_size = t.shape
     outer_stride = t.stride()
     attrs, ctx = t.__tensor_flatten__()
-    unflatten_fns = {
-        attr: flatten(getattr(t, attr), pack, unpack) for attr in attrs
-    }
+    unflatten_fns = {attr: flatten(getattr(t, attr), pack, unpack) for attr in attrs}
 
     def unflatten():
         attrs_ = {attr: unflatten_fn() for attr, unflatten_fn in unflatten_fns.items()}
         return cls.__tensor_unflatten__(attrs_, ctx, outer_size, outer_stride)
 
     return unflatten
+
 
 class TracerHooks(torch.autograd.graph.saved_tensors_hooks):
     def __init__(self, node_outputs):
@@ -259,32 +287,34 @@ class TracerHooks(torch.autograd.graph.saved_tensors_hooks):
         super().__init__(pack_hook, unpack_hook)
 
 
-
-
 # We're doing side effects that dynamo doesn't know about
-_global_node_outputs = None
+_global_node_outputs = WeakTensorKeyDictionary()
+_is_checkpoint_enabled = False
+
+
+def is_checkpoint_enabled():
+    return _is_checkpoint_enabled
 
 
 class apply_ac_policy:
     """Apply a policy to all tensors produced in the context"""
+
     # Recomputing can only be done at the op level, but saving can be done at
     # the tensor level. When does this distiction matter?
-    def __init__(self, policy_fn="recompute_all"):
+    def __init__(self, policy_fn: Union[str, Callable] = "recompute_all"):
         self.policy_fn = policy_fn
 
     @torch._dynamo.disable
     def __enter__(self):
-        global _global_node_outputs
-
-        self.outer_most = _global_node_outputs is None
+        global _is_checkpoint_enabled
+        self.outer_most = not _is_checkpoint_enabled
 
         if self.outer_most:
-            self.node_outputs = WeakTensorKeyDictionary()
-            self.tracer_mode_ctx = TracerMode(self.node_outputs)
-            self.tracer_hooks_ctx = TracerHooks(self.node_outputs)
+            self.tracer_mode_ctx = TracerMode(_global_node_outputs)
+            self.tracer_hooks_ctx = TracerHooks(_global_node_outputs)
             self.tracer_mode_ctx.__enter__()
             self.tracer_hooks_ctx.__enter__()
-            _global_node_outputs = self.node_outputs
+            _is_checkpoint_enabled = True
 
         self.push_policy_ctx = push_policy(self.policy_fn)
         self.push_policy_ctx.__enter__()
@@ -293,76 +323,21 @@ class apply_ac_policy:
 
     @torch._dynamo.disable
     def __exit__(self, exc_type, exc_val, exc_tb):
-        global _global_node_outputs
+        global _is_checkpoint_enabled
 
         if self.outer_most:
             self.tracer_hooks_ctx.__exit__(exc_type, exc_val, exc_tb)
             self.tracer_mode_ctx.__exit__(exc_type, exc_val, exc_tb)
-            self.node_outputs.clear()
-            _global_node_outputs = None
+            _global_node_outputs.clear()
+            _is_checkpoint_enabled = False
 
         self.push_policy_ctx.__exit__(exc_type, exc_val, exc_tb)
 
         return False  # Don't suppress exceptions
 
 
-@torch._dynamo.allow_in_graph
 def tag_with_policy(t, policy):
-    """Tag a single tensor with a policy"""
-    # We might want want to improve the interaction when we're already in a
-    # context manager, e.g. respect MUST policies. For now, we override all
-    # current policies in the global policy stack.
-    from torch.fx.experimental.proxy_tensor import get_proxy_mode
+    # Avoid circular imports with torch._dynamo.allow_in_graph
+    from ._tag_with_policy import tag_with_policy as _tag_with_policy
 
-    def pack(t):
-        if _is_compiling(None, (t,), None):
-            # If we are compiling:
-            # 1. always save the tensor, so we don't trace out the recompute
-            # 2. set the policy on the fx node
-            from torch._subclasses.functional_tensor import mb_unwrap_functional_tensor
-
-            mode = get_proxy_mode()
-            meta = None
-
-            if mode is not None:
-                # Notes:
-                # - We don't have a proxy mode during the first time we
-                #   trace through in AOTAutograd.
-                # - ProxyMode sees tensors AFTER FunctionalTensor is unwrapped
-                proxy_tensor = mode.tracer.tensor_tracker[mb_unwrap_functional_tensor(t)]
-                meta = proxy_tensor.proxy.node.meta
-
-            if _global_node_outputs is not None:
-                ac_node, idx = _global_node_outputs[t]
-                ac_node.out[idx] = t.detach()
-                if meta is None:
-                    meta = ac_node.current_fx_meta
-
-            if meta is not None:
-                meta["recompute"] = policy
-            return
-        elif _global_node_outputs is None:
-            # If we're in eager and not in an ac context, I am only allowed to
-            # "save" the tensor, which would be a no-op in eager.
-            # Allowing this is useful if the user sometimes runs under eager
-            # and compile.
-            if is_save_policy(policy):
-                # no-op
-                return
-            else:
-                raise RuntimeError(
-                    "Cannot use tag_with_policy with non-save policy outside of"
-                    " a context manager"
-                )
-        else:
-            # If we're in eager and we are in a context
-            node, idx = _global_node_outputs[t]
-            if is_save_policy(policy):
-                if _global_node_outputs[t].node.out is None:
-                    _global_node_outputs[t].node.out = dict()
-                _global_node_outputs[t].node.out[idx] = t.detach()
-            else:
-                _global_node_outputs[t].node.out[idx] = None
-            return t
-
-    _unused_unflatten_fn = flatten(t, pack, lambda x: x)
+    _tag_with_policy(t, policy)
