@@ -339,6 +339,10 @@ class apply_ac_policy:
 
         return False  # Don't suppress exceptions
 
+def apply_ac_policy1(fn, *args, policy_fn="policy_fn", **kwargs):
+    with apply_ac_policy(policy_fn):
+        return fn(*args, **kwargs)
+
 
 def tag_with_policy(t, policy):
     # Avoid circular imports with torch._dynamo.allow_in_graph

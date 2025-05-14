@@ -12,6 +12,7 @@ from torch.utils._pytree import tree_map_only
 from torch.utils.checkpoint import CheckpointPolicy
 from torch.utils.flop_counter import FlopCounterMode
 
+<<<<<<< HEAD
 
 @contextlib.contextmanager
 def allow_ambient_mode_to_run_first():
@@ -23,6 +24,14 @@ def allow_ambient_mode_to_run_first():
         yield
     finally:
         ac_experimental._tracer_is_infra_mode = True
+=======
+from ac_experimental import (
+    apply_ac_policy,
+    SAVE_WITH_HOOKS,
+    tag_with_policy,
+    apply_ac_policy1,
+)
+>>>>>>> 7287ed2 (Add functional variant)
 
 
 class SaveRecomputePolicyTest(TestCase):
@@ -339,6 +348,23 @@ class SaveRecomputePolicyTest(TestCase):
 
             self.assertEqual(act_mem_sac2, 1.0)
             self.assertEqual(bw_flops_sac2, 2.0)
+
+    def test_function_variant(self):
+        torch._dynamo.config._hopify_generic_wrap_fn_kwarg_keys[apply_ac_policy1] = (
+            "policy_fn",
+        )
+
+        def g(x):
+            return x.sin().cos() * 10
+
+        @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
+        def fn(x):
+            return apply_ac_policy1(g, x, policy_fn="recompute_all")
+
+        a = torch.rand((4, 4), requires_grad=True)
+        out = fn(a)
+        out.sum().backward()
+
 
     # Test peak `memory
     # Test multi-output non-optimality
