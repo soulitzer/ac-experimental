@@ -93,15 +93,19 @@ def current_global_policy(ctx, out, op, *args, **kwargs):
     return current_policy
 
 
-# Subclass instead of using namedtuple directly so that it's a pytree leaf
-class NodeOutput(NamedTuple):
+
+# Subclass instead of using namedtuple directly and remove `_asdict` method
+# so that it's a pytree leaf
+class _NodeOutput(NamedTuple):
     node: "Node"
     idx: int
 
 
-# remove `_asdict` method to make it an opaque leaf (pytree checks `_fields`, `_make`, `_asdict`)
-# Is there a better way to do this?
-del NodeOutput._asdict
+del _NodeOutput._asdict
+
+
+class NodeOutput(_NodeOutput):
+    pass
 
 
 def realize_and_decref(node_output):
