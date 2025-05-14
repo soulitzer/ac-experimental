@@ -12,7 +12,6 @@ from torch.utils._pytree import tree_map_only
 from torch.utils.checkpoint import CheckpointPolicy
 from torch.utils.flop_counter import FlopCounterMode
 
-<<<<<<< HEAD
 
 @contextlib.contextmanager
 def allow_ambient_mode_to_run_first():
@@ -24,14 +23,14 @@ def allow_ambient_mode_to_run_first():
         yield
     finally:
         ac_experimental._tracer_is_infra_mode = True
-=======
+
+
 from ac_experimental import (
     apply_ac_policy,
     SAVE_WITH_HOOKS,
     tag_with_policy,
     apply_ac_policy1,
 )
->>>>>>> 7287ed2 (Add functional variant)
 
 
 class SaveRecomputePolicyTest(TestCase):
