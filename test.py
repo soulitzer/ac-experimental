@@ -68,6 +68,24 @@ class SaveRecomputePolicyTest(TestCase):
         self.assertEqual(grad_a, grad_a_ref)
         self.assertEqual(grad_b, grad_b_ref)
 
+    def test_multi_output_with_tensor_tagging(self):
+        def fn(x):
+            a, b = x.split_with_sizes([2, 3], dim=0)
+            x = x * a.sum() * b.sum()
+            var, mean = torch.var_mean(x, dim=0)
+            tag_with_policy(var, policy=CheckpointPolicy.MUST_SAVE)
+            return var + mean
+
+        a = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0], requires_grad=True)
+
+        with apply_ac_policy(policy_fn="recompute_all"):
+            out = fn(a)
+
+        (grad,) = torch.autograd.grad(out, a)
+        (grad_ref,) = torch.autograd.grad(fn(a), a)
+
+        torch.equal(grad, grad_ref)
+
     def test_traceable_wrapper_subclass(self):
         count = [0]
 

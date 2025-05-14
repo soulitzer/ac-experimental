@@ -146,7 +146,7 @@ class Node:
         ):
             new_args = tree_map_only(NodeOutput, realize_and_decref, self.args)
             raw_out = self.func(*new_args)
-            self.out = list(raw_out) if isinstance(raw_out, tuple) else [raw_out]
+            self.out = list(raw_out) if isinstance(raw_out, (list, tuple)) else [raw_out]
         out = self.out[idx]
         self.nb_users[idx] -= 1
         if self.nb_users[idx] == 0:
