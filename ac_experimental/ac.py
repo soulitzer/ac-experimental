@@ -93,7 +93,6 @@ def current_global_policy(ctx, out, op, *args, **kwargs):
     return current_policy
 
 
-
 # Subclass instead of using namedtuple directly and remove `_asdict` method
 # so that it's a pytree leaf
 class _NodeOutput(NamedTuple):
@@ -121,6 +120,7 @@ class Node:
         self,
         func=None,
         args=None,
+        kwargs=None,
         outs: tuple = None,
         custom_pack=None,
         custom_unpack=None,
@@ -130,6 +130,7 @@ class Node:
         custom_pack = custom_pack if custom_pack is not None else lambda x: x
         self.func = func
         self.args = args
+        self.kwargs = kwargs
         self.out = None
         self.current_fx_meta = current_fx_meta
         self.nb_users = dict()  # out_idx -> nb_users
@@ -144,9 +145,14 @@ class Node:
             or (isinstance(self.out, list) and self.out[idx] is None)
             or (isinstance(self.out, dict) and self.out.get(idx) is None)
         ):
-            new_args = tree_map_only(NodeOutput, realize_and_decref, self.args)
-            raw_out = self.func(*new_args)
-            self.out = list(raw_out) if isinstance(raw_out, (list, tuple)) else [raw_out]
+            new_args, new_kwargs = tree_map_only(
+                NodeOutput, realize_and_decref, (self.args, self.kwargs)
+            )
+
+            raw_out = self.func(*new_args, **new_kwargs)
+            self.out = (
+                list(raw_out) if isinstance(raw_out, (list, tuple)) else [raw_out]
+            )
         out = self.out[idx]
         self.nb_users[idx] -= 1
         if self.nb_users[idx] == 0:
@@ -165,7 +171,7 @@ def get_node_output(node_outputs, t):
     if t not in node_outputs:
         # If the tensor was created in the checkpoint region, then it would've
         # been saved to node_outputs. If it's not there, then it's an input
-        node_outputs[t] = NodeOutput(Node(None, None, (t,)), 0)
+        node_outputs[t] = NodeOutput(Node(None, None, None, (t,)), 0)
     return node_outputs[t]
 
 
@@ -212,8 +218,10 @@ class TracerMode(TorchDispatchMode):
         out = func(*args, **kwargs)
 
         # Non-tensor are always kept alive by the node
-        wrapped_args = tree_map_only(
-            torch.Tensor, functools.partial(get_node_output, self.node_outputs), args
+        wrapped_args, wrapped_kwargs = tree_map_only(
+            torch.Tensor,
+            functools.partial(get_node_output, self.node_outputs),
+            (args, kwargs),
         )
         # TODO: nodes shouldn't be public API right?
         ctx = Context(self.node_outputs)
@@ -234,13 +242,14 @@ class TracerMode(TorchDispatchMode):
             Node(
                 func,
                 None,
+                None,
                 out_tuple,
                 custom_pack,
                 custom_unpack,
                 fx_traceback.current_meta,
             )
             if (should_save or is_compiling)
-            else Node(func, wrapped_args, None)
+            else Node(func, wrapped_args, wrapped_kwargs, None)
         )
         for idx, t in enumerate(out_tuple):
             if isinstance(t, torch.Tensor):
@@ -338,6 +347,7 @@ class apply_ac_policy:
         self.push_policy_ctx.__exit__(exc_type, exc_val, exc_tb)
 
         return False  # Don't suppress exceptions
+
 
 def apply_ac_policy1(fn, *args, policy_fn="policy_fn", **kwargs):
     with apply_ac_policy(policy_fn):

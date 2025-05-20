@@ -27,9 +27,9 @@ def allow_ambient_mode_to_run_first():
 
 from ac_experimental import (
     apply_ac_policy,
+    apply_ac_policy1,
     SAVE_WITH_HOOKS,
     tag_with_policy,
-    apply_ac_policy1,
 )
 
 
@@ -67,6 +67,19 @@ class SaveRecomputePolicyTest(TestCase):
 
         self.assertEqual(grad_a, grad_a_ref)
         self.assertEqual(grad_b, grad_b_ref)
+
+    def test_with_kwargs(self):
+        def fn(a):
+            # If the kwarg for to_copy is not preserved, we get the error:
+            # view_as_complex is only supported for half, float and double tensors
+            return torch.view_as_complex(a.float()).sin()
+
+        a = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16, requires_grad=True)
+
+        with apply_ac_policy("recompute_all"):
+            out = fn(a)
+
+        out.sum().real.backward()
 
     def test_multi_output_with_tensor_tagging(self):
         def fn(x):
@@ -381,7 +394,6 @@ class SaveRecomputePolicyTest(TestCase):
         a = torch.rand((4, 4), requires_grad=True)
         out = fn(a)
         out.sum().backward()
-
 
     # Test peak `memory
     # Test multi-output non-optimality
