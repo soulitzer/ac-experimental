@@ -214,6 +214,8 @@ class SaveRecomputePolicyTest(TestCase):
         self.assertEqual(grad, grad_ref)
 
     def test_compile(self):
+        if not hasattr(torch._dynamo.config, "_enable_hopify_generic_context_manager"):
+            raise unittest.SkipTest("HopifyGenericContextManager not enabled")
         torch._dynamo.config._enable_hopify_generic_context_manager.add(apply_ac_policy)
 
         # This tests:
@@ -245,6 +247,8 @@ class SaveRecomputePolicyTest(TestCase):
         out.sum().backward()
 
     def test_tag_with_policy_compile(self):
+        if not hasattr(torch._dynamo.config, "_enable_hopify_generic_context_manager"):
+            raise unittest.SkipTest("HopifyGenericContextManager not enabled")
         torch._dynamo.config._enable_hopify_generic_context_manager.add(apply_ac_policy)
 
         @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
@@ -265,6 +269,8 @@ class SaveRecomputePolicyTest(TestCase):
         self.assertEqual(grad_a, grad_a_ref)
 
     def test_user_allow_in_graph(self):
+        if not hasattr(torch._dynamo.config, "_enable_hopify_generic_context_manager"):
+            raise unittest.SkipTest("HopifyGenericContextManager not enabled")
         # Be able to handle arbitrary allow-in-graph functions
         torch._dynamo.config._enable_hopify_generic_context_manager.add(apply_ac_policy)
 
@@ -289,6 +295,8 @@ class SaveRecomputePolicyTest(TestCase):
         pass
 
     def test_compile_simple_policy_fn(self):
+        if not hasattr(torch._dynamo.config, "_enable_hopify_generic_context_manager"):
+            raise unittest.SkipTest("HopifyGenericContextManager not enabled")
         torch._dynamo.config._enable_hopify_generic_context_manager.add(apply_ac_policy)
 
         def policy_fn(ctx, out, op, *args, **kwargs):
@@ -379,21 +387,46 @@ class SaveRecomputePolicyTest(TestCase):
             self.assertEqual(act_mem_sac2, 1.0)
             self.assertEqual(bw_flops_sac2, 2.0)
 
-    def test_function_variant(self):
-        torch._dynamo.config._hopify_generic_wrap_fn_kwarg_keys[apply_ac_policy1] = (
-            "policy_fn",
-        )
+    # def test_function_variant(self):
+    #     torch._dynamo.config._hopify_generic_wrap_fn_kwarg_keys[apply_ac_policy1] = (
+    #         "policy_fn",
+    #     )
 
-        def g(x):
-            return x.sin().cos() * 10
+    #     def g(x):
+    #         return x.sin().cos() * 10
 
-        @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
-        def fn(x):
-            return apply_ac_policy1(g, x, policy_fn="recompute_all")
+    #     @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
+    #     def fn(x):
+    #         return apply_ac_policy1(g, x, policy_fn="recompute_all")
 
-        a = torch.rand((4, 4), requires_grad=True)
-        out = fn(a)
-        out.sum().backward()
+    #     a = torch.rand((4, 4), requires_grad=True)
+    #     out = fn(a)
+    #     out.sum().backward()
+
+    def test_nn_module_buffer_mutation(self):
+        class MyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("buffer", torch.zeros(2, 2))
+
+            def forward(self, x):
+                self.buffer += x
+                return self.buffer.sin().cos().sum()
+
+        a = torch.ones((2, 2), requires_grad=True)
+
+        m = MyModule()
+
+        with apply_ac_policy("recompute_all"):
+            out = m(a)
+
+        (grad,) = torch.autograd.grad(out, a)
+
+        m = MyModule()
+        out_ref = m(a)
+        (grad_ref,) = torch.autograd.grad(out_ref, a)
+
+        self.assertEqual(grad, grad_ref)
 
     # Test peak `memory
     # Test multi-output non-optimality

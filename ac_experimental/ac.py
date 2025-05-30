@@ -1,6 +1,6 @@
 import contextlib
 import functools
-from typing import Callable, NamedTuple, Union
+from typing import Callable, NamedTuple, Optional, Union
 
 import torch
 import torch._subclasses.functional_tensor
@@ -121,12 +121,13 @@ class Node:
         func=None,
         args=None,
         kwargs=None,
-        outs: tuple = None,
+        outs: Optional[tuple] = None,
         custom_pack=None,
         custom_unpack=None,
         current_fx_meta=None,
+        is_inplace=False,
     ):
-        self.custom_unpack = custom_unpack if custom_unpack is not None else lambda x: x
+        self.custom_unpack = custom_unpack
         custom_pack = custom_pack if custom_pack is not None else lambda x: x
         self.func = func
         self.args = args
@@ -134,10 +135,42 @@ class Node:
         self.out = None
         self.current_fx_meta = current_fx_meta
         self.nb_users = dict()  # out_idx -> nb_users
+        self.out_versions = None
         if outs is not None:
             self.out = [
                 custom_pack(x) if isinstance(x, torch.Tensor) else x for x in outs
             ]
+            # Note [ Version counter checking ]
+            #
+            # Each NodeOutput corresponds to a particular version of a tensor.
+            # If an operator is in-place, we create a new Node just like we do
+            # for out-of-place operators. The tracker dict is also updated for
+            # the mutated tensor to now point to the newer NodeOutput.
+            #
+            # IMPORTANT: It is required for any operator that mutates its inputs to
+            # return that mutated tensor as output. This is currently not enforced.
+            #
+            # If an operator is in-place, we currently save its all of its outputs.
+            # This is not always optimal. If the mutated tensor wasn't otherwise
+            # saved e.g. it is not an input or saved via SAC. OR if the mutated
+            # tensor is saved but this op has multiple outputs and now we need to
+            # save additional tensors.
+            self.out_versions = [
+                (
+                    None
+                    if (not isinstance(o, torch.Tensor) or o.is_inference())
+                    else o._version
+                )
+                for o in self.out
+            ]
+            # HACK: For in-place, we need to manually increment the counter since the
+            # version won't be updated until we return to the ADInplaceOrView kernel :(
+            # For now assume that the first output is the one that was mutated, and
+            # assume the result is always that the version is incremented by 1.
+            # This should be true for most built-in inplace ops, but not always true,
+            # e.g. for BatchNorm.
+            if is_inplace and self.out_versions[0] is not None:
+                self.out_versions[0] += 1
 
     def realize_and_decref(self, idx):
         if (
@@ -148,7 +181,6 @@ class Node:
             new_args, new_kwargs = tree_map_only(
                 NodeOutput, realize_and_decref, (self.args, self.kwargs)
             )
-
             raw_out = self.func(*new_args, **new_kwargs)
             self.out = (
                 list(raw_out) if isinstance(raw_out, (list, tuple)) else [raw_out]
@@ -157,12 +189,24 @@ class Node:
         self.nb_users[idx] -= 1
         if self.nb_users[idx] == 0:
             self.out[idx] = None
-        x_out = self.custom_unpack(out)
-        return x_out
 
+        if self.custom_unpack is not None:
+            out = self.custom_unpack(out)
+
+        # See Note [ Version counter checking ]
+        if (
+            self.custom_unpack is None
+            and self.out_versions is not None
+            and self.out_versions[idx] is not None
+        ):
+            assert (
+                self.out_versions[idx] == out._version
+            ), f"expected version {self.out_versions[idx]}, but got version {out._version}"
+        return out
+
+    # See Note [AC Node use-count tracking to clear cached tensors sooner]
     def incref(self, idx):
         if self.out is None and len(self.nb_users) == 0:
-            # _ = [incref(arg) if isinstance(arg, NodeOutput) else arg for arg in self.args]
             tree_map_only(NodeOutput, incref, self.args)
         self.nb_users[idx] = self.nb_users.get(idx, 0) + 1
 
@@ -215,7 +259,6 @@ class TracerMode(TorchDispatchMode):
         ):
             return NotImplemented
         kwargs = {} if kwargs is None else kwargs
-        out = func(*args, **kwargs)
 
         # Non-tensor are always kept alive by the node
         wrapped_args, wrapped_kwargs = tree_map_only(
@@ -223,6 +266,15 @@ class TracerMode(TorchDispatchMode):
             functools.partial(get_node_output, self.node_outputs),
             (args, kwargs),
         )
+
+        any_is_inplace = False
+        for idx, arg in enumerate(func._schema.arguments):
+            if arg.alias_info is not None and arg.alias_info.is_write:
+                any_is_inplace = True
+                break
+
+        out = func(*args, **kwargs)
+
         # TODO: nodes shouldn't be public API right?
         ctx = Context(self.node_outputs)
         global_policy = current_global_policy(ctx, out, func, *args, **kwargs)
@@ -231,6 +283,7 @@ class TracerMode(TorchDispatchMode):
         is_compiling = _is_compiling(func, args, kwargs)
 
         if is_compiling:
+            # TODO: for inplace, we end up saving but not updating the policy
             fx_traceback.current_meta["recompute"] = global_policy
 
         custom_pack, custom_unpack = None, None
@@ -247,8 +300,9 @@ class TracerMode(TorchDispatchMode):
                 custom_pack,
                 custom_unpack,
                 fx_traceback.current_meta,
+                is_inplace=any_is_inplace,
             )
-            if (should_save or is_compiling)
+            if (should_save or is_compiling or any_is_inplace)
             else Node(func, wrapped_args, wrapped_kwargs, None)
         )
         for idx, t in enumerate(out_tuple):
@@ -283,6 +337,10 @@ class TracerHooks(torch.autograd.graph.saved_tensors_hooks):
     def __init__(self, node_outputs):
         def _pack(raw_tensor):
             node_output = get_node_output(node_outputs, raw_tensor)
+            # The assumption here is that every pack has a corresponding
+            # unpack. Otherwise the refcounting is wrong and more tensors
+            # will be kept alive.
+            # We also don't support retain_graph=True.
             incref(node_output)
             return node_output
 
