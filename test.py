@@ -1,9 +1,10 @@
 import contextlib
 import unittest
 
+from ac_experimental.ac import push_policy
 import torch
 
-from ac_experimental import apply_ac_policy, SAVE_WITH_HOOKS, tag_with_policy
+from ac_experimental import apply_ac_policy, SAVE_WITH_HOOKS, tag_with_policy, apply_ac_policy_fn
 from torch.overrides import TorchFunctionMode
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch.testing._internal.two_tensor import TwoTensor
@@ -23,14 +24,6 @@ def allow_ambient_mode_to_run_first():
         yield
     finally:
         ac_experimental._tracer_is_infra_mode = True
-
-
-from ac_experimental import (
-    apply_ac_policy,
-    apply_ac_policy1,
-    SAVE_WITH_HOOKS,
-    tag_with_policy,
-)
 
 
 class SaveRecomputePolicyTest(TestCase):
@@ -213,7 +206,7 @@ class SaveRecomputePolicyTest(TestCase):
 
         self.assertEqual(grad, grad_ref)
 
-    def test_compile(self):
+    def test_compile_with_context_manager(self):
         if not hasattr(torch._dynamo.config, "_enable_hopify_generic_context_manager"):
             raise unittest.SkipTest("HopifyGenericContextManager not enabled")
         torch._dynamo.config._enable_hopify_generic_context_manager.add(apply_ac_policy)
@@ -246,7 +239,7 @@ class SaveRecomputePolicyTest(TestCase):
         out = fn(a)
         out.sum().backward()
 
-    def test_tag_with_policy_compile(self):
+    def test_tag_with_policy_compile_with_context_manager(self):
         if not hasattr(torch._dynamo.config, "_enable_hopify_generic_context_manager"):
             raise unittest.SkipTest("HopifyGenericContextManager not enabled")
         torch._dynamo.config._enable_hopify_generic_context_manager.add(apply_ac_policy)
@@ -268,7 +261,7 @@ class SaveRecomputePolicyTest(TestCase):
         grad_a_ref = torch.autograd.grad(fn(a).sum(), a)[0]
         self.assertEqual(grad_a, grad_a_ref)
 
-    def test_user_allow_in_graph(self):
+    def test_user_allow_in_graph_with_context_manager(self):
         if not hasattr(torch._dynamo.config, "_enable_hopify_generic_context_manager"):
             raise unittest.SkipTest("HopifyGenericContextManager not enabled")
         # Be able to handle arbitrary allow-in-graph functions
@@ -294,7 +287,7 @@ class SaveRecomputePolicyTest(TestCase):
         # dynamo is running. Restore it when we run aot autograd.
         pass
 
-    def test_compile_simple_policy_fn(self):
+    def test_compile_simple_policy_fn_with_context_manager(self):
         if not hasattr(torch._dynamo.config, "_enable_hopify_generic_context_manager"):
             raise unittest.SkipTest("HopifyGenericContextManager not enabled")
         torch._dynamo.config._enable_hopify_generic_context_manager.add(apply_ac_policy)
@@ -387,22 +380,6 @@ class SaveRecomputePolicyTest(TestCase):
             self.assertEqual(act_mem_sac2, 1.0)
             self.assertEqual(bw_flops_sac2, 2.0)
 
-    # def test_function_variant(self):
-    #     torch._dynamo.config._hopify_generic_wrap_fn_kwarg_keys[apply_ac_policy1] = (
-    #         "policy_fn",
-    #     )
-
-    #     def g(x):
-    #         return x.sin().cos() * 10
-
-    #     @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
-    #     def fn(x):
-    #         return apply_ac_policy1(g, x, policy_fn="recompute_all")
-
-    #     a = torch.rand((4, 4), requires_grad=True)
-    #     out = fn(a)
-    #     out.sum().backward()
-
     def test_nn_module_buffer_mutation(self):
         class MyModule(torch.nn.Module):
             def __init__(self):
@@ -428,7 +405,127 @@ class SaveRecomputePolicyTest(TestCase):
 
         self.assertEqual(grad, grad_ref)
 
-    # Test peak `memory
+    # The same tests as above, but with the wrapper version of the API
+    def test_compile_nesting(self):
+        def g(x):
+            return x.sin().cos().sin()
+
+        def g_ac(x):
+            return apply_ac_policy_fn(g, x, policy_fn="recompute_all")
+
+        @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
+        def f(x):
+            return g(x.exp().exp()) * 10 * 10 * 10 * 10
+
+        @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
+        def f_ac(x):
+            # Is PREFER_SAVE the neutral policy that we are looking for?
+            return apply_ac_policy_fn(g_ac, x.exp().exp(), policy_fn="must_save_all") * 10 * 10 * 10 * 10
+
+        a = torch.rand((2, 2), requires_grad=True)
+        f_ac(a).sum().backward()
+        b = a.detach().clone().requires_grad_(True)
+        f(b).sum().backward()
+        self.assertEqual(a.grad, b.grad)
+
+    def test_tag_with_policy_compile(self):
+        def g(x):
+            cos = x.sin().sin().cos()
+            z = cos @ cos
+            tag_with_policy(z, CheckpointPolicy.MUST_SAVE)
+            out = z.sin().sin() * 10 * 10 * 10 * 10
+            return out
+
+        def g2(x):
+            # Same function but without tagging
+            cos = x.sin().sin().cos()
+            z = cos @ cos
+            out = z.sin().sin() * 10 * 10 * 10 * 10
+            return out
+
+        @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
+        def f(x):
+            return apply_ac_policy_fn(g, x, policy_fn="recompute_all")
+
+        @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
+        def f2(x):
+            return apply_ac_policy_fn(g2, x, policy_fn="recompute_all")
+
+        # Test the case where there is no outer AC context
+        @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
+        def f3(x):
+            cos = x.sin().sin().cos()
+            z = cos @ cos
+            tag_with_policy(z, CheckpointPolicy.MUST_SAVE)
+            out = z.sin().sin() * 10 * 10 * 10 * 10
+            return out
+
+        a = torch.rand((2, 2), requires_grad=True)
+        f(a).sum().backward()
+
+        b = a.detach().clone().requires_grad_(True)
+        f2(b).sum().backward()
+
+        c = a.detach().clone().requires_grad_(True)
+        f3(c).sum().backward()
+
+        self.assertEqual(a.grad, b.grad)
+        self.assertEqual(b.grad, c.grad)
+
+    def test_adjacent_ac(self):
+        # tests the case where two recompute_all regions are next to one another
+        # it tests to see that we properly save the inputs to both of the regions
+        def f(x):
+            return x.sin().cos() * 2
+
+        def g(x):
+            return x.exp().exp() * 3
+
+        @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
+        def h(x):
+            out = apply_ac_policy_fn(f, x, policy_fn="recompute_all")
+            out = apply_ac_policy_fn(g, out, policy_fn="recompute_all")
+            return out
+
+        a = torch.rand((2, 2), requires_grad=True)
+        out = h(a)
+        out.sum().backward()
+
+    def test_user_allow_in_graph(self):
+        # Be able to handle arbitrary allow-in-graph functions
+
+        @torch._dynamo.allow_in_graph
+        def test_fn(x):
+            return x.clone(), x.clone()
+
+        @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
+        def fn(x):
+            a, b = apply_ac_policy_fn(test_fn, x, policy_fn="recompute_all")
+            c = a + b
+            return c.sin()
+
+        a = torch.rand((2, 2), requires_grad=True)
+        out = fn(a)
+        out.sum().backward()
+
+    def test_compile_simple_policy_fn(self):
+        def policy_fn(ctx, out, op, *args, **kwargs) -> CheckpointPolicy:
+            if op == torch.ops.aten.cos.default:
+                return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.PREFER_RECOMPUTE
+
+        def g(x):
+            return x.sin().cos().sin().exp() * 10
+
+        @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
+        def f(x):
+            return apply_ac_policy_fn(g, x, policy_fn=policy_fn)
+
+        a = torch.rand((4, 4), requires_grad=True)
+        out = f(a)
+        out.sum().backward()
+
+
     # Test multi-output non-optimality
     # Test Nested subclasses
 

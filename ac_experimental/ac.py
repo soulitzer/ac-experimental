@@ -1,6 +1,6 @@
 import contextlib
 import functools
-from typing import Callable, NamedTuple, Optional, Union
+from typing import Any, Callable, NamedTuple, Optional, Union
 
 import torch
 import torch._subclasses.functional_tensor
@@ -91,6 +91,45 @@ def current_global_policy(ctx, out, op, *args, **kwargs):
                 continue
             current_policy = policy
     return current_policy
+
+
+def set_policy(t, policy):
+    from torch.fx.experimental.proxy_tensor import get_proxy_mode
+    from torch._subclasses.functional_tensor import mb_unwrap_functional_tensor
+
+    mode = get_proxy_mode()
+    meta = None
+
+    if mode is not None:
+        # Notes:
+        # - We don't have a proxy mode during the first time we
+        #   trace through in AOTAutograd.
+        # - ProxyMode sees tensors AFTER FunctionalTensor is unwrapped
+        proxy_tensor = mode.tracer.tensor_tracker[
+            mb_unwrap_functional_tensor(t)
+        ]
+        meta = proxy_tensor.proxy.node.meta
+
+    if is_checkpoint_enabled():
+        ac_node, idx = _global_node_outputs[t]
+        ac_node.out[idx] = t.detach()
+        if meta is None:
+            # Only update the meta if the mode is None because
+            # The meta from the proxy mode should be more accurate.
+            meta = ac_node.current_fx_meta
+
+    if meta is not None:
+        # We won't have meta if we're not inside checkpoint region
+        # AND we're during the first trace through AOTAutograd.
+        # That is fine though because it is the second trace where
+        # we actually care about annotating.
+        meta["recompute"] = policy
+        # Note [ dummy ac_graph_id ]
+        # ac_graph_id is used by the old AC to be able to insert MUST_SAVE
+        # between AC regions. This is not needed for the new AC so give
+        # everything the same id.
+        meta["ac_graph_id"] = 0
+    return
 
 
 # Subclass instead of using namedtuple directly and remove `_asdict` method
@@ -216,6 +255,9 @@ def get_node_output(node_outputs, t):
         # If the tensor was created in the checkpoint region, then it would've
         # been saved to node_outputs. If it's not there, then it's an input
         node_outputs[t] = NodeOutput(Node(None, None, None, (t,)), 0)
+
+        if _is_compiling(None, (t,), None):
+            set_policy(t, CheckpointPolicy.MUST_SAVE)
     return node_outputs[t]
 
 
@@ -285,6 +327,8 @@ class TracerMode(TorchDispatchMode):
         if is_compiling:
             # TODO: for inplace, we end up saving but not updating the policy
             fx_traceback.current_meta["recompute"] = global_policy
+            # See Note [ dummy ac_graph_id ]
+            fx_traceback.current_meta["ac_graph_id"] = 0
 
         custom_pack, custom_unpack = None, None
         if isinstance(global_policy, SAVE_WITH_HOOKS):
@@ -299,6 +343,7 @@ class TracerMode(TorchDispatchMode):
                 out_tuple,
                 custom_pack,
                 custom_unpack,
+                # Should we only pass this in if we're comiling?
                 fx_traceback.current_meta,
                 is_inplace=any_is_inplace,
             )
@@ -407,9 +452,20 @@ class apply_ac_policy:
         return False  # Don't suppress exceptions
 
 
-def apply_ac_policy1(fn, *args, policy_fn="policy_fn", **kwargs):
-    with apply_ac_policy(policy_fn):
-        return fn(*args, **kwargs)
+def _apply_ac_policy_wrapper_impl(fn, *args, policy_fn="recompute_all", **kwargs):
+    def wrapper(*args, **kwargs):
+        with apply_ac_policy(policy_fn):
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+# I don't know if I necessarily like having apply_ac_policy and apply_ac_policy_fn as the API names
+def apply_ac_policy_fn(fn, *args, policy_fn: Union[str, Callable[[Any], CheckpointPolicy]]="recompute_all", **kwargs):
+    from torch._higher_order_ops.wrap import dynamo_bypassing_wrapper
+
+    return dynamo_bypassing_wrapper(
+        functools.partial(_apply_ac_policy_wrapper_impl, policy_fn=policy_fn), fn, *args, **kwargs
+    )
 
 
 def tag_with_policy(t, policy):
