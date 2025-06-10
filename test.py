@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import unittest
 
 from ac_experimental.ac import push_policy
@@ -24,6 +25,16 @@ def allow_ambient_mode_to_run_first():
         yield
     finally:
         ac_experimental._tracer_is_infra_mode = True
+
+
+# This might take a while to land in cores
+def skip_if_no_hopify_generic_context_manager(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if not hasattr(torch._dynamo.config, "_enable_hopify_generic_context_manager"):
+            raise unittest.SkipTest("HopifyGenericContextManager not enabled")
+        return func(*args, **kwargs)
+    return wrapper
 
 
 class SaveRecomputePolicyTest(TestCase):
@@ -139,6 +150,9 @@ class SaveRecomputePolicyTest(TestCase):
             out.sum().backward()
 
     def test_torch_dispatch_mode(self):
+        # This is testing that the dispatcher mode happens above, so that policy_fn
+        if not hasattr(torch._C._TorchDispatchModeKey, "AC_TRACER"):
+            raise unittest.SkipTest("AC_TRACER Infra mode has not landed")
         count = [0]
 
         class Mul2Mode(TorchDispatchMode):
@@ -206,9 +220,8 @@ class SaveRecomputePolicyTest(TestCase):
 
         self.assertEqual(grad, grad_ref)
 
+    @skip_if_no_hopify_generic_context_manager
     def test_compile_with_context_manager(self):
-        if not hasattr(torch._dynamo.config, "_enable_hopify_generic_context_manager"):
-            raise unittest.SkipTest("HopifyGenericContextManager not enabled")
         torch._dynamo.config._enable_hopify_generic_context_manager.add(apply_ac_policy)
 
         # This tests:
@@ -239,9 +252,8 @@ class SaveRecomputePolicyTest(TestCase):
         out = fn(a)
         out.sum().backward()
 
+    @skip_if_no_hopify_generic_context_manager
     def test_tag_with_policy_compile_with_context_manager(self):
-        if not hasattr(torch._dynamo.config, "_enable_hopify_generic_context_manager"):
-            raise unittest.SkipTest("HopifyGenericContextManager not enabled")
         torch._dynamo.config._enable_hopify_generic_context_manager.add(apply_ac_policy)
 
         @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
@@ -261,9 +273,8 @@ class SaveRecomputePolicyTest(TestCase):
         grad_a_ref = torch.autograd.grad(fn(a).sum(), a)[0]
         self.assertEqual(grad_a, grad_a_ref)
 
+    @skip_if_no_hopify_generic_context_manager
     def test_user_allow_in_graph_with_context_manager(self):
-        if not hasattr(torch._dynamo.config, "_enable_hopify_generic_context_manager"):
-            raise unittest.SkipTest("HopifyGenericContextManager not enabled")
         # Be able to handle arbitrary allow-in-graph functions
         torch._dynamo.config._enable_hopify_generic_context_manager.add(apply_ac_policy)
 
@@ -405,6 +416,35 @@ class SaveRecomputePolicyTest(TestCase):
 
         self.assertEqual(grad, grad_ref)
 
+    def test_nn_module_buffer_mutation_compile(self):
+        class MyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("buffer", torch.zeros(2, 2))
+
+            def forward(self, x):
+                self.buffer += x
+                return self.buffer.sin().cos().sum()
+
+        @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
+        def compiled_fn(m, x):
+            return apply_ac_policy_fn(m, x, policy_fn="recompute_all")
+
+        a = torch.ones((2, 2), requires_grad=True)
+
+        # Test compiled version
+        m = MyModule()
+        out = compiled_fn(m, a)
+        (grad,) = torch.autograd.grad(out, a)
+
+        # Reference (eager version)
+        m_ref = MyModule()
+        with apply_ac_policy("recompute_all"):
+            out_ref = m_ref(a)
+        (grad_ref,) = torch.autograd.grad(out_ref, a)
+
+        self.assertEqual(grad, grad_ref)
+
     # The same tests as above, but with the wrapper version of the API
     def test_compile_nesting(self):
         def g(x):
@@ -492,8 +532,6 @@ class SaveRecomputePolicyTest(TestCase):
         out.sum().backward()
 
     def test_user_allow_in_graph(self):
-        # Be able to handle arbitrary allow-in-graph functions
-
         @torch._dynamo.allow_in_graph
         def test_fn(x):
             return x.clone(), x.clone()
@@ -525,6 +563,36 @@ class SaveRecomputePolicyTest(TestCase):
         out = f(a)
         out.sum().backward()
 
+    def test_saving_inference_mode_tensor_errors(self):
+        b = torch.tensor(2., requires_grad=True)
+
+        with apply_ac_policy("recompute_all"):
+            c = b.sin()
+            with torch.inference_mode():
+                d = c.exp()
+                with self.assertRaisesRegex(
+                    RuntimeError, "Saving inference tensors is not supported"
+                ):
+                    tag_with_policy(d, CheckpointPolicy.MUST_SAVE)
+
+    def test_batch_norm(self):
+
+        pass
+
+    def test_randomness_errors(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "RNG ops are not supported"
+        ):
+            with apply_ac_policy("recompute_all"):
+               torch.rand(10, 10)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "RNG ops are not supported"
+        ):
+            with apply_ac_policy("must_save_all"):
+               torch.rand(10, 10)
+
+        pass
 
     # Test multi-output non-optimality
     # Test Nested subclasses

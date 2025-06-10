@@ -1,6 +1,6 @@
 import contextlib
 import functools
-from typing import Any, Callable, NamedTuple, Optional, Union
+from typing import Any, Callable, NamedTuple, Union
 
 import torch
 import torch._subclasses.functional_tensor
@@ -12,7 +12,7 @@ from torch.utils._python_dispatch import (
 )
 from torch.utils._pytree import tree_map_only
 
-from torch.utils.checkpoint import _policy_from_bool, CheckpointPolicy
+from torch.utils.checkpoint import _policy_from_bool, CheckpointPolicy, _maybe_detach
 from torch.utils.weak import WeakTensorKeyDictionary
 
 
@@ -93,43 +93,70 @@ def current_global_policy(ctx, out, op, *args, **kwargs):
     return current_policy
 
 
-def set_policy(t, policy):
+def set_policy_for_partitioner(t: torch.Tensor, policy):
+    assert isinstance(t, torch.Tensor)
+    assert _is_compiling(None, (t,), None)
+
     from torch.fx.experimental.proxy_tensor import get_proxy_mode
     from torch._subclasses.functional_tensor import mb_unwrap_functional_tensor
 
     mode = get_proxy_mode()
     meta = None
 
-    if mode is not None:
-        # Notes:
-        # - We don't have a proxy mode during the first time we
-        #   trace through in AOTAutograd.
-        # - ProxyMode sees tensors AFTER FunctionalTensor is unwrapped
-        proxy_tensor = mode.tracer.tensor_tracker[
-            mb_unwrap_functional_tensor(t)
-        ]
-        meta = proxy_tensor.proxy.node.meta
-
-    if is_checkpoint_enabled():
-        ac_node, idx = _global_node_outputs[t]
-        ac_node.out[idx] = t.detach()
-        if meta is None:
-            # Only update the meta if the mode is None because
-            # The meta from the proxy mode should be more accurate.
-            meta = ac_node.current_fx_meta
-
-    if meta is not None:
-        # We won't have meta if we're not inside checkpoint region
-        # AND we're during the first trace through AOTAutograd.
+    if mode is None:
+        # We won't have meta during the first trace through AOTAutograd.
         # That is fine though because it is the second trace where
         # we actually care about annotating.
-        meta["recompute"] = policy
-        # Note [ dummy ac_graph_id ]
-        # ac_graph_id is used by the old AC to be able to insert MUST_SAVE
-        # between AC regions. This is not needed for the new AC so give
-        # everything the same id.
-        meta["ac_graph_id"] = 0
-    return
+        return
+    # ProxyMode sees tensors after FunctionalTensor is unwrapped
+    proxy_tensor = mode.tracer.tensor_tracker[
+        mb_unwrap_functional_tensor(t)
+    ]
+    meta = proxy_tensor.proxy.node.meta
+    meta["recompute"] = policy
+    # Note [ dummy ac_graph_id ]
+    # ac_graph_id is used by the old AC to be able to insert MUST_SAVE
+    # between adjacent AC regions. This is not needed for the new AC,
+    # so give everything the same id to bypass the logic.
+    meta["ac_graph_id"] = 0
+
+
+def save_tensor(t: torch.Tensor, policy):
+    # Precondition: t is being tracked
+    ac_node, idx = _global_node_outputs[t]
+
+    if t.is_inference():
+        raise RuntimeError(
+            "Saving inference tensors is not supported. "
+        )
+    if isinstance(policy, SAVE_WITH_HOOKS):
+        # Another option is to grab the ambient saved tensor hooks?
+        # Why are we doing it this way?
+        t = policy.pack(t)
+        ac_node.custom_pack = policy.unpack
+    else:
+        # What was the issue with the old SAC wrt inference mode + detach?
+        # Is there any reason to not always detach? If we care about tensor identity.
+        t = _maybe_detach(t, True)
+
+    ac_node.out[idx] = t
+    # Note [ Version counter checking ]
+    #
+    # Each NodeOutput corresponds to a particular version of a tensor.
+    # If an operator is in-place, we create a new Node just like we do
+    # for out-of-place operators. The tracker dict is also updated for
+    # the mutated tensor to now point to the newer NodeOutput.
+    #
+    # IMPORTANT: It is required for any operator that mutates its inputs to
+    # return that mutated tensor as output. This is currently not enforced!
+    #
+    # If an operator is in-place, we currently save its all of its outputs.
+    # This is not always optimal. If the mutated tensor wasn't otherwise
+    # saved e.g. it is not an input or saved via SAC. OR if the mutated
+    # tensor is saved but this op has multiple outputs and now we need to
+    # save additional tensors.
+    ac_node.out_versions[idx] = t._version
+
 
 
 # Subclass instead of using namedtuple directly and remove `_asdict` method
@@ -160,70 +187,29 @@ class Node:
         func=None,
         args=None,
         kwargs=None,
-        outs: Optional[tuple] = None,
         custom_pack=None,
         custom_unpack=None,
-        current_fx_meta=None,
-        is_inplace=False,
     ):
         self.custom_unpack = custom_unpack
         custom_pack = custom_pack if custom_pack is not None else lambda x: x
         self.func = func
         self.args = args
         self.kwargs = kwargs
-        self.out = None
-        self.current_fx_meta = current_fx_meta
+        self.out: dict[int, Any] = dict()
         self.nb_users = dict()  # out_idx -> nb_users
-        self.out_versions = None
-        if outs is not None:
-            self.out = [
-                custom_pack(x) if isinstance(x, torch.Tensor) else x for x in outs
-            ]
-            # Note [ Version counter checking ]
-            #
-            # Each NodeOutput corresponds to a particular version of a tensor.
-            # If an operator is in-place, we create a new Node just like we do
-            # for out-of-place operators. The tracker dict is also updated for
-            # the mutated tensor to now point to the newer NodeOutput.
-            #
-            # IMPORTANT: It is required for any operator that mutates its inputs to
-            # return that mutated tensor as output. This is currently not enforced.
-            #
-            # If an operator is in-place, we currently save its all of its outputs.
-            # This is not always optimal. If the mutated tensor wasn't otherwise
-            # saved e.g. it is not an input or saved via SAC. OR if the mutated
-            # tensor is saved but this op has multiple outputs and now we need to
-            # save additional tensors.
-            self.out_versions = [
-                (
-                    None
-                    if (not isinstance(o, torch.Tensor) or o.is_inference())
-                    else o._version
-                )
-                for o in self.out
-            ]
-            # HACK: For in-place, we need to manually increment the counter since the
-            # version won't be updated until we return to the ADInplaceOrView kernel :(
-            # For now assume that the first output is the one that was mutated, and
-            # assume the result is always that the version is incremented by 1.
-            # This should be true for most built-in inplace ops, but not always true,
-            # e.g. for BatchNorm.
-            if is_inplace and self.out_versions[0] is not None:
-                self.out_versions[0] += 1
+        self.out_versions = dict()
 
     def realize_and_decref(self, idx):
-        if (
-            self.out is None
-            or (isinstance(self.out, list) and self.out[idx] is None)
-            or (isinstance(self.out, dict) and self.out.get(idx) is None)
-        ):
+        if self.out.get(idx) is None:
             new_args, new_kwargs = tree_map_only(
                 NodeOutput, realize_and_decref, (self.args, self.kwargs)
             )
             raw_out = self.func(*new_args, **new_kwargs)
-            self.out = (
-                list(raw_out) if isinstance(raw_out, (list, tuple)) else [raw_out]
-            )
+            out_tuple = tuple(raw_out) if isinstance(raw_out, (list, tuple)) else (raw_out,)
+            for t in out_tuple:
+                if isinstance(t, torch.Tensor):
+                    self.out_versions[idx] = t._version
+                self.out[idx] = t
         out = self.out[idx]
         self.nb_users[idx] -= 1
         if self.nb_users[idx] == 0:
@@ -235,17 +221,17 @@ class Node:
         # See Note [ Version counter checking ]
         if (
             self.custom_unpack is None
-            and self.out_versions is not None
-            and self.out_versions[idx] is not None
+            and self.out_versions.get(idx) is not None
         ):
             assert (
                 self.out_versions[idx] == out._version
-            ), f"expected version {self.out_versions[idx]}, but got version {out._version}"
+            ), f"{self.func}, expected version {self.out_versions[idx]}, but got version {out._version}"
         return out
 
     # See Note [AC Node use-count tracking to clear cached tensors sooner]
     def incref(self, idx):
-        if self.out is None and len(self.nb_users) == 0:
+        # TODO: have some test to check for leaks?
+        if all(v is None for v in self.out.values()):
             tree_map_only(NodeOutput, incref, self.args)
         self.nb_users[idx] = self.nb_users.get(idx, 0) + 1
 
@@ -254,10 +240,12 @@ def get_node_output(node_outputs, t):
     if t not in node_outputs:
         # If the tensor was created in the checkpoint region, then it would've
         # been saved to node_outputs. If it's not there, then it's an input
-        node_outputs[t] = NodeOutput(Node(None, None, None, (t,)), 0)
+        node_outputs[t] = NodeOutput(Node(None, None, None), 0)
 
         if _is_compiling(None, (t,), None):
-            set_policy(t, CheckpointPolicy.MUST_SAVE)
+            set_policy_for_partitioner(t, CheckpointPolicy.MUST_SAVE)
+        save_tensor(t, CheckpointPolicy.MUST_SAVE)
+
     return node_outputs[t]
 
 
@@ -290,6 +278,11 @@ class TracerMode(TorchDispatchMode):
             self._mode_key = torch._C._TorchDispatchModeKey.AC_TRACER
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if torch.Tag.nondeterministic_seeded in func.tags:
+            raise RuntimeError(
+                f"apply_ac_policy: RNG ops are not supported, but got {func} "
+            )
+
         if any(
             t
             not in [
@@ -320,39 +313,47 @@ class TracerMode(TorchDispatchMode):
         # TODO: nodes shouldn't be public API right?
         ctx = Context(self.node_outputs)
         global_policy = current_global_policy(ctx, out, func, *args, **kwargs)
-        should_save = is_save_policy(global_policy)
-
-        is_compiling = _is_compiling(func, args, kwargs)
-
-        if is_compiling:
-            # TODO: for inplace, we end up saving but not updating the policy
-            fx_traceback.current_meta["recompute"] = global_policy
-            # See Note [ dummy ac_graph_id ]
-            fx_traceback.current_meta["ac_graph_id"] = 0
-
-        custom_pack, custom_unpack = None, None
-        if isinstance(global_policy, SAVE_WITH_HOOKS):
-            custom_pack, custom_unpack = global_policy.pack, global_policy.unpack
-
         out_tuple = tuple(out) if isinstance(out, (list, tuple)) else (out,)
-        node = (
-            Node(
-                func,
-                None,
-                None,
-                out_tuple,
-                custom_pack,
-                custom_unpack,
-                # Should we only pass this in if we're comiling?
-                fx_traceback.current_meta,
-                is_inplace=any_is_inplace,
-            )
-            if (should_save or is_compiling or any_is_inplace)
-            else Node(func, wrapped_args, wrapped_kwargs, None)
+
+        do_save_logic = (
+            is_save_policy(global_policy)
+            or any_is_inplace
+            or _is_compiling(func, args, kwargs)
         )
+        if do_save_logic:
+            # We don't want to store the args in the case where we save!
+            wrapped_args, wrapped_kwargs = None, None
+
+        node = Node(
+            func,
+            wrapped_args,
+            wrapped_kwargs)
+
+        # Register the nodes before fully setting them up since save_tensors requires it
         for idx, t in enumerate(out_tuple):
             if isinstance(t, torch.Tensor):
                 self.node_outputs[t] = NodeOutput(node, idx)
+
+        for idx, t in enumerate(out_tuple):
+            if not isinstance(t, torch.Tensor):
+                node.out[idx] = t
+
+            if do_save_logic:
+                save_tensor(t, global_policy)
+
+            if _is_compiling(None, (t,), None):
+                set_policy_for_partitioner(t, global_policy)
+
+        # HACK: For in-place, we need to manually increment the counter since the
+        # version won't be updated until we return to the ADInplaceOrView kernel :(
+        # For now assume that the first output is the one that was mutated, and
+        # that result's version is always incremented by 1.
+        # This should be true for most built-in inplace ops, but not always true,
+        # e.g. for BatchNorm.
+        if any_is_inplace:
+            assert node.out_versions.get(0) is not None, f"{func}"
+            node.out_versions[0] += 1
+
         return out
 
     @classmethod
@@ -468,8 +469,38 @@ def apply_ac_policy_fn(fn, *args, policy_fn: Union[str, Callable[[Any], Checkpoi
     )
 
 
-def tag_with_policy(t, policy):
-    # Avoid circular imports with torch._dynamo.allow_in_graph
-    from ._tag_with_policy import tag_with_policy as _tag_with_policy
+# Lazy initialization to avoid reference cycles on import
+_tag_with_policy_impl = None
 
-    _tag_with_policy(t, policy)
+
+def _tag_with_policy(t, policy):
+    if not isinstance(t, torch.Tensor):
+        raise ValueError(
+            f"tag_with_policy: Expected a tensor, but got: {t}"
+        )
+
+    if not is_save_policy(policy):
+        raise ValueError(
+            f"tag_with_policy: Only 'saving' policies are currently supported. but got: {policy}"
+        )
+
+    def pack(t):
+        if _is_compiling(None, (t,), None):
+            set_policy_for_partitioner(t, policy)
+
+        if is_checkpoint_enabled():
+            save_tensor(t, policy)
+        return t
+
+    _unused_unflatten_fn = flatten(t, pack, lambda x: x)
+
+
+def tag_with_policy(t, policy):
+    """Tag a single tensor with a policy"""
+    global _tag_with_policy_impl
+
+    # Lazy initialization to avoid reference cycles on import
+    if _tag_with_policy_impl is None:
+        _tag_with_policy_impl = torch._dynamo.allow_in_graph(_tag_with_policy)
+
+    return _tag_with_policy_impl(t, policy)
