@@ -474,22 +474,22 @@ def _apply_ac_policy_wrapper_factory_impl(fn, *args, make_policy_fn=None, **kwar
 # I don't know if I necessarily like having apply_ac_policy and apply_ac_policy_fn as the API names
 def apply_ac_policy_fn(fn, *args, policy_fn: Union[str, Callable[[Any], CheckpointPolicy]]="recompute_all", is_factory=False, **kwargs):
     from torch._higher_order_ops.wrap import dynamo_bypassing_wrapper
-    from torch._dynamo.utils import allow_side_effects
+    try:
+        # Need https://github.com/pytorch/pytorch/pull/155715 or something else
+        from torch._dynamo.utils import allow_side_effects
+    except ImportError:
+        # Fallback to no-op shim
+        def allow_side_effects(fn: Callable, *args, **kwargs):
+            return fn(*args, **kwargs)
 
     def wrapped_fn(*args, **kwargs):
         return allow_side_effects(fn, *args, **kwargs)
 
     if is_factory:
-        # def partial1(fn, *args, **kwargs):
-        #     return _apply_ac_policy_wrapper_factory_impl(fn, *args, make_policy_fn=policy_fn, **kwargs)
-
         return dynamo_bypassing_wrapper(
             functools.partial(_apply_ac_policy_wrapper_factory_impl, make_policy_fn=policy_fn),
             wrapped_fn, *args, **kwargs
         )
-
-    # def partial2(fn, *args, **kwargs):
-        # return _apply_ac_policy_wrapper_impl(fn, *args, policy_fn=policy_fn, **kwargs)
 
     return dynamo_bypassing_wrapper(
         functools.partial(_apply_ac_policy_wrapper_impl, policy_fn=policy_fn),
