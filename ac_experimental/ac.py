@@ -210,6 +210,7 @@ class Node:
                 if isinstance(t, torch.Tensor):
                     self.out_versions[idx] = t._version
                 self.out[idx] = t
+
         out = self.out[idx]
         self.nb_users[idx] -= 1
         if self.nb_users[idx] == 0:
@@ -278,11 +279,6 @@ class TracerMode(TorchDispatchMode):
             self._mode_key = torch._C._TorchDispatchModeKey.AC_TRACER
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if torch.Tag.nondeterministic_seeded in func.tags:
-            raise RuntimeError(
-                f"apply_ac_policy: RNG ops are not supported, but got {func} "
-            )
-
         if any(
             t
             not in [
@@ -315,6 +311,12 @@ class TracerMode(TorchDispatchMode):
         global_policy = current_global_policy(ctx, out, func, *args, **kwargs)
         out_tuple = tuple(out) if isinstance(out, (list, tuple)) else (out,)
 
+        if torch.Tag.nondeterministic_seeded in func.tags and not is_save_policy(global_policy):
+            raise RuntimeError(
+                f"apply_ac_policy: recomputing RNG ops are not supported, but got {func}. "
+                "Please save the outputs of this op."
+            )
+
         do_save_logic = (
             is_save_policy(global_policy)
             or any_is_inplace
@@ -337,6 +339,7 @@ class TracerMode(TorchDispatchMode):
         for idx, t in enumerate(out_tuple):
             if not isinstance(t, torch.Tensor):
                 node.out[idx] = t
+                continue
 
             if do_save_logic:
                 save_tensor(t, global_policy)
@@ -361,7 +364,7 @@ class TracerMode(TorchDispatchMode):
         return True
 
 
-def flatten(t, pack, unpack):
+def flatten_nested_subclasses(t, pack, unpack):
     if not is_traceable_wrapper_subclass(t):
         packed = pack(t)
         return lambda: unpack(packed)
@@ -370,7 +373,7 @@ def flatten(t, pack, unpack):
     outer_size = t.shape
     outer_stride = t.stride()
     attrs, ctx = t.__tensor_flatten__()
-    unflatten_fns = {attr: flatten(getattr(t, attr), pack, unpack) for attr in attrs}
+    unflatten_fns = {attr: flatten_nested_subclasses(getattr(t, attr), pack, unpack) for attr in attrs}
 
     def unflatten():
         attrs_ = {attr: unflatten_fn() for attr, unflatten_fn in unflatten_fns.items()}
@@ -395,7 +398,7 @@ class TracerHooks(torch.autograd.graph.saved_tensors_hooks):
             return out
 
         def pack_hook(raw_tensor):
-            return flatten(raw_tensor, _pack, _unpack)
+            return flatten_nested_subclasses(raw_tensor, _pack, _unpack)
 
         def unpack_hook(unflatten_fn):
             x = unflatten_fn()
@@ -459,13 +462,38 @@ def _apply_ac_policy_wrapper_impl(fn, *args, policy_fn="recompute_all", **kwargs
             return fn(*args, **kwargs)
     return wrapper
 
+def _apply_ac_policy_wrapper_factory_impl(fn, *args, make_policy_fn=None, **kwargs):
+    def wrapper(*args, **kwargs):
+        assert make_policy_fn is not None
+        policy_fn = make_policy_fn()
+        with apply_ac_policy(policy_fn):
+            return fn(*args, **kwargs)
+    return wrapper
+
 
 # I don't know if I necessarily like having apply_ac_policy and apply_ac_policy_fn as the API names
-def apply_ac_policy_fn(fn, *args, policy_fn: Union[str, Callable[[Any], CheckpointPolicy]]="recompute_all", **kwargs):
+def apply_ac_policy_fn(fn, *args, policy_fn: Union[str, Callable[[Any], CheckpointPolicy]]="recompute_all", is_factory=False, **kwargs):
     from torch._higher_order_ops.wrap import dynamo_bypassing_wrapper
+    from torch._dynamo.utils import allow_side_effects
+
+    def wrapped_fn(*args, **kwargs):
+        return allow_side_effects(fn, *args, **kwargs)
+
+    if is_factory:
+        # def partial1(fn, *args, **kwargs):
+        #     return _apply_ac_policy_wrapper_factory_impl(fn, *args, make_policy_fn=policy_fn, **kwargs)
+
+        return dynamo_bypassing_wrapper(
+            functools.partial(_apply_ac_policy_wrapper_factory_impl, make_policy_fn=policy_fn),
+            wrapped_fn, *args, **kwargs
+        )
+
+    # def partial2(fn, *args, **kwargs):
+        # return _apply_ac_policy_wrapper_impl(fn, *args, policy_fn=policy_fn, **kwargs)
 
     return dynamo_bypassing_wrapper(
-        functools.partial(_apply_ac_policy_wrapper_impl, policy_fn=policy_fn), fn, *args, **kwargs
+        functools.partial(_apply_ac_policy_wrapper_impl, policy_fn=policy_fn),
+        wrapped_fn, *args, **kwargs
     )
 
 
@@ -490,9 +518,8 @@ def _tag_with_policy(t, policy):
 
         if is_checkpoint_enabled():
             save_tensor(t, policy)
-        return t
 
-    _unused_unflatten_fn = flatten(t, pack, lambda x: x)
+    flatten_nested_subclasses(t, pack, lambda x: x)
 
 
 def tag_with_policy(t, policy):
