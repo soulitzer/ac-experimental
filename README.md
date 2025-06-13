@@ -49,7 +49,7 @@ Note: Today compile is ONLY supported for the second syntax. (Nightly version of
 | Robustness to global state | ❌ Brittle; you must ensure that the provided function runs in the same exact way during the original forward and recompute (e.g. TorchFunctionMode/TorchDispatchMode, spurious logging, first iteration initialization). | ✅ Post-dispatch graph is captured and replayed |
 | Recursive checkpointing | ✅ Supported | ❌ Not supported |
 | Higher order gradients support | ✅ Supported | ❌ Not supported |
-| RNG operators |  ✅ Supported | ❌ Not supported today (may be possible to do, may have overhead)
+| RNG operators |  ✅ Supported | ❌ Today the output of RNG ops are required to be saved (alternatively, we could stash RNG state for every op)
 | non-torch/non-aten ops, e.g. NumPy ops | ✅ non-torch/non-aten can be recomputed | ❌ non-ATen ops cannot be recomputed (you should wrap them in custom ops) |
 | In-place | ... | ... |
 | Side Effects in compile | ❌ Not supported | 🚧 Planned |
