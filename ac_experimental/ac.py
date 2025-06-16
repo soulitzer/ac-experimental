@@ -490,19 +490,14 @@ def apply_ac_policy_fn(fn, *args, policy_fn: Union[str, Callable[[Any], Checkpoi
     global _is_checkpoint_enabled
 
     from torch._higher_order_ops.wrap import dynamo_bypassing_wrapper
-    try:
-        # Need https://github.com/pytorch/pytorch/pull/155715 or something else
-        from torch._dynamo.utils import _UNSAFE_allow_side_effects
-    except ImportError:
-        # Fallback to no-op shim
-        def _UNSAFE_allow_side_effects(fn: Callable, *args, **kwargs):
-            return fn(*args, **kwargs)
+    from .inner_impl import _UNSAFE_allow_side_effects
 
     def wrapped_fn(*args, **kwargs):
         return _UNSAFE_allow_side_effects(fn, *args, **kwargs)
 
     prev_is_checkpoint_enabled = _is_checkpoint_enabled
-    _is_checkpoint_enabled = True
+    if not _is_checkpoint_enabled:
+        _is_checkpoint_enabled = True
     try:
         if is_factory:
             return dynamo_bypassing_wrapper(
@@ -515,40 +510,12 @@ def apply_ac_policy_fn(fn, *args, policy_fn: Union[str, Callable[[Any], Checkpoi
             wrapped_fn, *args, **kwargs
         )
     finally:
-        _is_checkpoint_enabled = prev_is_checkpoint_enabled
-
-
-# Lazy initialization to avoid reference cycles on import
-_tag_with_policy_impl = None
-
-
-def _tag_with_policy(t, policy):
-    if not isinstance(t, torch.Tensor):
-        raise ValueError(
-            f"tag_with_policy: Expected a tensor, but got: {t}"
-        )
-
-    if not is_save_policy(policy):
-        raise ValueError(
-            f"tag_with_policy: Only 'saving' policies are currently supported. but got: {policy}"
-        )
-
-    def pack(t):
-        if _is_compiling(None, (t,), None):
-            set_policy_for_partitioner(t, policy)
-
-        if _is_checkpoint_enabled:
-            save_tensor(t, policy)
-
-    flatten_nested_subclasses(t, pack, lambda x: x)
+        if _is_checkpoint_enabled != prev_is_checkpoint_enabled:
+            _is_checkpoint_enabled = prev_is_checkpoint_enabled
 
 
 def tag_with_policy(t, policy):
     """Tag a single tensor with a policy"""
-    global _tag_with_policy_impl
-
-    # Lazy initialization to avoid reference cycles on import
-    if _tag_with_policy_impl is None:
-        _tag_with_policy_impl = torch._dynamo.allow_in_graph(_tag_with_policy)
-
-    return _tag_with_policy_impl(t, policy)
+    # Import from separate file to avoid import cycles and allow_in_graph issues
+    from .inner_impl import tag_with_policy_decorated
+    return tag_with_policy_decorated(t, policy)
