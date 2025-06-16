@@ -2,7 +2,7 @@ import contextlib
 import functools
 import unittest
 
-from ac_experimental.ac import push_policy
+from ac_experimental.ac import is_checkpoint_enabled, push_policy
 import torch
 
 from ac_experimental import apply_ac_policy, SAVE_WITH_HOOKS, tag_with_policy, apply_ac_policy_fn
@@ -13,6 +13,18 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map_only
 from torch.utils.checkpoint import CheckpointPolicy
 from torch.utils.flop_counter import FlopCounterMode
+from torch._dynamo.testing import CompileCounterWithBackend, normalize_gm
+
+
+class EagerRecordGraphAndInputs:
+    def __init__(self) -> None:
+        self.graphs = []
+        self.example_inputs = []
+
+    def __call__(self, gm: torch.fx.GraphModule, example_inputs):
+        self.graphs.append(gm)
+        self.example_inputs.append(example_inputs)
+        return gm
 
 
 @contextlib.contextmanager
@@ -579,20 +591,196 @@ class SaveRecomputePolicyTest(TestCase):
 
         pass
 
+    def test_custom_policy_with_state(self):
+        # This doesn't test the exact setup, mainly the 
+        from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+
+        _save_list = {
+            torch.ops.aten.cos.default,
+            torch.ops.aten.sin.default,
+        }
+        # If you want your policy to have state, pass a class. Make sure to
+        # create it in global scope to avoid new instances triggering recompiles.
+        class CustomPolicy:
+            def __init__(self):
+                super().__init__()
+                self.meta = dict()
+
+            def __call__(self, ctx, out, func, *args, **kwargs):
+                cos_count_key = f"cos_count"
+                if func == torch.ops.aten.cos.default:
+                    self.meta[cos_count_key] = self.meta.get(cos_count_key, 0) + 1
+
+                to_save = func in _save_list and not (
+                    func == torch.ops.aten.cos.default and self.meta[cos_count_key] % 2 == 0
+                )
+                return (
+                    CheckpointPolicy.MUST_SAVE
+                    if to_save
+                    else CheckpointPolicy.PREFER_RECOMPUTE
+                )
+
+        def f(x):
+            return x.sin().cos().sin().cos().exp() * 10
+
+        def f_ac(x):
+            return apply_ac_policy_fn(f, x, policy_fn=CustomPolicy, is_factory=True)
+
+        a = torch.rand((2, 2), requires_grad=True)
+        out = f_ac(a).sum()
+        out.backward()
+
+        def context_fn():
+            policy = CustomPolicy()
+            return create_selective_checkpoint_contexts(policy)
+
+        b = a.detach().clone().requires_grad_(True)
+
+        def f_ac_2(x):
+            return torch.utils.checkpoint.checkpoint(
+                f, b,
+                use_reentrant=False,
+                context_fn=context_fn,
+            )
+        out_ref = f_ac_2(a).sum()
+        self.assertEqual(out, out_ref)
+        out_ref.backward()
+        self.assertEqual(a.grad, b.grad)
+
+        compiled_f = torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)(f_ac)
+        compiled_f_2 = torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)(f_ac_2)
+        out = compiled_f(a).sum()
+        out.backward()
+        out_ref = compiled_f_2(a).sum()
+        self.assertEqual(out, out_ref)
+        out_ref.backward()
+        self.assertEqual(a.grad, b.grad)
+
+    # We want to support detecting whether we are in a checkpoint region.
+    # Just seeing if we've entered into checkpoint is not enough because
+    # the policy could be to SAVE_ALL. The more accurate thing to do is
+    # to actually refer to the global policy stack and see if the current
+    # policy is to save for the particular op in question.
+    #
+    # This is hard to do. If the policy stack were updated inside the HOP wrapper,
+    # Since that logic is not run during dynamo, if I'm observing in the
+    # HOP body I wouldn't see the update.
+    # We could fix that by letting dynamo trace the policy stack push/pop.
+    # But this also doens't  work though because the code observing
+    # the side effect (the torch dispatch mode) because side effects traced by
+    # dynamo are not observable in aot autograd tracing.
+    #
+    # Today what we do is update in parallel a "is in checkpoint" flag that
+    # the actual implementation in aot autograd doesn't rely on.
+    def test_branch_on_is_in_ac_region(self):
+        # What happens in the AC outside graph case?
+        # Note: Dynamo is tracing through the policy_fn now
+        # from ac_experimental import is_save_policy, current_global_policy
+        from ac_experimental import is_checkpoint_enabled
+
+        def test_fn(x):
+            # if not is_save_policy(current_global_policy(None, None, torch.ops.aten.sin.default, (None,), {})):
+            if is_checkpoint_enabled():
+                return x.sin().sin()
+            else:
+                return x.cos(), x.cos()
+
+        backend = EagerRecordGraphAndInputs()
+        cnt = torch._dynamo.testing.CompileCounterWithBackend(backend)
+
+        @torch.compile(backend=cnt, fullgraph=True)
+        def fn(x):
+            a, b = apply_ac_policy_fn(test_fn, x, policy_fn="recompute_all")
+            c = a + b
+            return c.exp()
+
+        # Next: actually inspect the graph to see if there are sin
+        a = torch.rand((2, 2), requires_grad=True)
+        out = fn(a)
+        out.sum().backward()
+
+        self.assertEqual(cnt.frame_count, 1)
+        self.assertEqual(cnt.op_count, 6)
+        self.assertEqual(len(backend.graphs), 1)
+        self.assertEqual(len(backend.example_inputs), 1)
+
+        actual = normalize_gm(backend.graphs[0].print_readable(print_output=False))
+        self.assertExpectedInline(
+            actual,
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_x_: "f32[2, 2]"):
+        l_x_ = L_x_
+
+        wrap_body_0 = self.wrap_body_0
+        dynamo_bypassing_wrapper = torch.ops.higher_order.dynamo_bypassing_wrapper('_dynamo_bypassing_wrapper_fn', wrap_body_0, l_x_);  wrap_body_0 = l_x_ = None
+        getitem: "f32[2, 2]" = dynamo_bypassing_wrapper[0];  dynamo_bypassing_wrapper = None
+
+        a: "f32[2]" = getitem[0]
+        b: "f32[2]" = getitem[1];  getitem = None
+
+        c: "f32[2]" = a + b;  a = b = None
+
+        exp: "f32[2]" = c.exp();  c = None
+        return (exp,)
+
+    class wrap_body_0(torch.nn.Module):
+        def forward(self, l_x_: "f32[2, 2]"):
+            sin: "f32[2, 2]" = l_x_.sin();  l_x_ = None
+            sin_1: "f32[2, 2]" = sin.sin();  sin = None
+            return (sin_1,)
+""",
+        )
+
+        backend = EagerRecordGraphAndInputs()
+        cnt = torch._dynamo.testing.CompileCounterWithBackend(backend)
+
+        @torch.compile(backend=cnt, fullgraph=True)
+        def fn_no_ac(x):
+            a, b = test_fn(x)
+            c = a + b
+            return c.exp()
+
+        # Next: actually inspect the graph to see if there are sin
+        a = torch.rand((2, 2), requires_grad=True)
+        out = fn_no_ac(a)
+        out.sum().backward()
+
+        self.assertEqual(cnt.frame_count, 1)
+        self.assertEqual(cnt.op_count, 4)
+        self.assertEqual(len(backend.graphs), 1)
+        self.assertEqual(len(backend.example_inputs), 1)
+
+        actual = normalize_gm(backend.graphs[0].print_readable(print_output=False))
+
+        self.assertExpectedInline(
+            actual,
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_x_: "f32[2, 2]"):
+        l_x_ = L_x_
+
+        a: "f32[2, 2]" = l_x_.cos()
+        b: "f32[2, 2]" = l_x_.cos();  l_x_ = None
+
+        c: "f32[2, 2]" = a + b;  a = b = None
+
+        exp: "f32[2, 2]" = c.exp();  c = None
+        return (exp,)
+""",
+        )
+
     def test_randomness_errors(self):
         with self.assertRaisesRegex(
-            RuntimeError, "RNG ops are not supported"
+            RuntimeError, "recomputing RNG ops are not supported"
         ):
             with apply_ac_policy("recompute_all"):
                torch.rand(10, 10)
 
-        with self.assertRaisesRegex(
-            RuntimeError, "RNG ops are not supported"
-        ):
-            with apply_ac_policy("must_save_all"):
-               torch.rand(10, 10)
+        # Saving the RNG op is OK
+        with apply_ac_policy("must_save_all"):
+            torch.rand(10, 10)
 
-        pass
 
     # Test multi-output non-optimality
     # Test Nested subclasses

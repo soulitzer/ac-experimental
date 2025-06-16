@@ -43,7 +43,7 @@ Note: Today compile is ONLY supported for the second syntax. (Nightly version of
 
 | **Features**      | **`torch.utils.checkpoint`** | **AC2**      |
 |--------|-----------------------------------|----------------------------|
-| Selective activation checkpoint (SAC) support | ❌ Limited support (cannot specific tensor to save, SAC policies cannot be nested, sub-optimal eager performance) | ✅ First-class support (nesting, tensor tagging are supported) |
+| Selective activation checkpoint (SAC) support | ❌ Limited support (Cannot specify saving specific tensor, SAC policies cannot be nested, sub-optimal eager performance) | ✅ First-class support (nesting, tensor tagging are supported) |
 | Eager performance | ❌ Possibly suboptimal: Always recompute from the beginning (incurring higher peak memory since all recomputed buffers must be materialized all at once); Unnecessarily do extra recompute; Save tensors that are not needed | ✅ More optimal: Recompute can start from the middle of the graph. Only tensors needed for recompute are saved. |
 | Semantics preserving | ❌ AC can change eager semantics (e.g. mutating a global or printing is performed twice)  | ✅ Side effects are not executed twice |
 | Robustness to global state | ❌ Brittle; you must ensure that the provided function runs in the same exact way during the original forward and recompute (e.g. TorchFunctionMode/TorchDispatchMode, spurious logging, first iteration initialization). | ✅ Post-dispatch graph is captured and replayed |

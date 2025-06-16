@@ -409,6 +409,7 @@ class TracerHooks(torch.autograd.graph.saved_tensors_hooks):
 
 # We're doing side effects that dynamo doesn't know about
 _global_node_outputs = WeakTensorKeyDictionary()
+_trace_mode_active = False
 _is_checkpoint_enabled = False
 
 
@@ -416,7 +417,7 @@ def is_checkpoint_enabled():
     return _is_checkpoint_enabled
 
 
-class apply_ac_policy:
+class _apply_ac_policy:
     """Apply a policy to all tensors produced in the context"""
 
     # Recomputing can only be done at the op level, but saving can be done at
@@ -426,15 +427,15 @@ class apply_ac_policy:
 
     @torch._dynamo.disable
     def __enter__(self):
-        global _is_checkpoint_enabled
-        self.outer_most = not _is_checkpoint_enabled
+        global _trace_mode_active
+        self.outer_most = not _trace_mode_active
 
         if self.outer_most:
             self.tracer_mode_ctx = TracerMode(_global_node_outputs)
             self.tracer_hooks_ctx = TracerHooks(_global_node_outputs)
             self.tracer_mode_ctx.__enter__()
             self.tracer_hooks_ctx.__enter__()
-            _is_checkpoint_enabled = True
+            _trace_mode_active = True
 
         self.push_policy_ctx = push_policy(self.policy_fn)
         self.push_policy_ctx.__enter__()
@@ -443,22 +444,35 @@ class apply_ac_policy:
 
     @torch._dynamo.disable
     def __exit__(self, exc_type, exc_val, exc_tb):
-        global _is_checkpoint_enabled
+        global _trace_mode_active
 
         if self.outer_most:
             self.tracer_hooks_ctx.__exit__(exc_type, exc_val, exc_tb)
             self.tracer_mode_ctx.__exit__(exc_type, exc_val, exc_tb)
             _global_node_outputs.clear()
-            _is_checkpoint_enabled = False
+            _trace_mode_active = False
 
         self.push_policy_ctx.__exit__(exc_type, exc_val, exc_tb)
 
         return False  # Don't suppress exceptions
 
 
+@contextlib.contextmanager
+def apply_ac_policy(policy_fn="recompute_all"):
+    global _is_checkpoint_enabled
+
+    prev_is_checkpoint_enabled = _is_checkpoint_enabled
+    _is_checkpoint_enabled = True
+    try:
+        with _apply_ac_policy(policy_fn=policy_fn):
+            yield
+    finally:
+        _is_checkpoint_enabled = prev_is_checkpoint_enabled
+
+
 def _apply_ac_policy_wrapper_impl(fn, *args, policy_fn="recompute_all", **kwargs):
     def wrapper(*args, **kwargs):
-        with apply_ac_policy(policy_fn):
+        with _apply_ac_policy(policy_fn):
             return fn(*args, **kwargs)
     return wrapper
 
@@ -466,35 +480,42 @@ def _apply_ac_policy_wrapper_factory_impl(fn, *args, make_policy_fn=None, **kwar
     def wrapper(*args, **kwargs):
         assert make_policy_fn is not None
         policy_fn = make_policy_fn()
-        with apply_ac_policy(policy_fn):
+        with _apply_ac_policy(policy_fn):
             return fn(*args, **kwargs)
     return wrapper
 
 
 # I don't know if I necessarily like having apply_ac_policy and apply_ac_policy_fn as the API names
 def apply_ac_policy_fn(fn, *args, policy_fn: Union[str, Callable[[Any], CheckpointPolicy]]="recompute_all", is_factory=False, **kwargs):
+    global _is_checkpoint_enabled
+
     from torch._higher_order_ops.wrap import dynamo_bypassing_wrapper
     try:
         # Need https://github.com/pytorch/pytorch/pull/155715 or something else
-        from torch._dynamo.utils import allow_side_effects
+        from torch._dynamo.utils import _UNSAFE_allow_side_effects
     except ImportError:
         # Fallback to no-op shim
-        def allow_side_effects(fn: Callable, *args, **kwargs):
+        def _UNSAFE_allow_side_effects(fn: Callable, *args, **kwargs):
             return fn(*args, **kwargs)
 
     def wrapped_fn(*args, **kwargs):
-        return allow_side_effects(fn, *args, **kwargs)
+        return _UNSAFE_allow_side_effects(fn, *args, **kwargs)
 
-    if is_factory:
+    prev_is_checkpoint_enabled = _is_checkpoint_enabled
+    _is_checkpoint_enabled = True
+    try:
+        if is_factory:
+            return dynamo_bypassing_wrapper(
+                functools.partial(_apply_ac_policy_wrapper_factory_impl, make_policy_fn=policy_fn),
+                wrapped_fn, *args, **kwargs
+            )
+
         return dynamo_bypassing_wrapper(
-            functools.partial(_apply_ac_policy_wrapper_factory_impl, make_policy_fn=policy_fn),
+            functools.partial(_apply_ac_policy_wrapper_impl, policy_fn=policy_fn),
             wrapped_fn, *args, **kwargs
         )
-
-    return dynamo_bypassing_wrapper(
-        functools.partial(_apply_ac_policy_wrapper_impl, policy_fn=policy_fn),
-        wrapped_fn, *args, **kwargs
-    )
+    finally:
+        _is_checkpoint_enabled = prev_is_checkpoint_enabled
 
 
 # Lazy initialization to avoid reference cycles on import
@@ -516,7 +537,7 @@ def _tag_with_policy(t, policy):
         if _is_compiling(None, (t,), None):
             set_policy_for_partitioner(t, policy)
 
-        if is_checkpoint_enabled():
+        if _is_checkpoint_enabled:
             save_tensor(t, policy)
 
     flatten_nested_subclasses(t, pack, lambda x: x)
