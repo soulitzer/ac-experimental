@@ -6,8 +6,6 @@ AC2 is a new tracer-based activation checkpoint implemented using TorchDispatchM
 ```bash
 git clone https://github.com/soulitzer/ac-experimental.git && cd ac-experimental && pip install -e .
 ```
-Or just copy paste the single self-contained file `ac_experimental/ac.py` for quick experimentation.
-
 ## Usage
 
 <details>
