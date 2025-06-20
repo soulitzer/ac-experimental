@@ -1,5 +1,6 @@
 import contextlib
 import functools
+import operator
 from typing import Any, Callable, NamedTuple, Union
 
 import torch
@@ -93,9 +94,24 @@ def current_global_policy(ctx, out, op, *args, **kwargs):
     return current_policy
 
 
+def is_getitem_of_multi_output(node):
+    if node.target != operator.getitem:
+        return False
+    parent = node.args[0]
+    return (
+        "tensor_meta" not in parent.meta
+        and node.op == "call_function"
+    )
+
+
 def set_policy_for_partitioner(t: torch.Tensor, policy):
     assert isinstance(t, torch.Tensor)
     assert _is_compiling(None, (t,), None)
+
+    if isinstance(policy, SAVE_WITH_HOOKS):
+        raise NotImplementedError(
+            "Saving with hooks is not supported in the compile."
+        )
 
     from torch.fx.experimental.proxy_tensor import get_proxy_mode
     from torch._subclasses.functional_tensor import mb_unwrap_functional_tensor
@@ -112,13 +128,20 @@ def set_policy_for_partitioner(t: torch.Tensor, policy):
     proxy_tensor = mode.tracer.tensor_tracker[
         mb_unwrap_functional_tensor(t)
     ]
-    meta = proxy_tensor.proxy.node.meta
-    meta["recompute"] = policy
+    node = proxy_tensor.proxy.node
+    if is_getitem_of_multi_output(node) and not is_save_policy(policy):
+        # If we marked the getitem of a multi-output op as recompute
+        # we must also must mark the parent as recompute.
+        parent = node.args[0]
+        parent.meta["recompute"] = policy
+        parent.meta["ac_graph_id"] = 0
+
+    node.meta["recompute"] = policy
     # Note [ dummy ac_graph_id ]
     # ac_graph_id is used by the old AC to be able to insert MUST_SAVE
     # between adjacent AC regions. This is not needed for the new AC,
     # so give everything the same id to bypass the logic.
-    meta["ac_graph_id"] = 0
+    node.meta["ac_graph_id"] = 0
 
 
 def save_tensor(t: torch.Tensor, policy):
