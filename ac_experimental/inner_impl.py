@@ -1,11 +1,11 @@
 import torch
 
-# Import _UNSAFE_allow_side_effects with fallback to shim
+# Import _disable_side_effect_safety_checks_for_current_subtracer with fallback to shim
 try:
-    from torch._dynamo.utils import _UNSAFE_allow_side_effects
+    from torch._dynamo.utils import _disable_side_effect_safety_checks_for_current_subtracer
 except (ImportError, AttributeError):
     # Fallback to no-op shim
-    def _UNSAFE_allow_side_effects(fn, *args, **kwargs):
+    def _disable_side_effect_safety_checks_for_current_subtracer(fn, *args, **kwargs):
         return fn(*args, **kwargs)
 
 

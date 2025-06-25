@@ -513,10 +513,10 @@ def apply_ac_policy_fn(fn, *args, policy_fn: Union[str, Callable[[Any], Checkpoi
     global _is_checkpoint_enabled
 
     from torch._higher_order_ops.wrap import dynamo_bypassing_wrapper
-    from .inner_impl import _UNSAFE_allow_side_effects
+    from .inner_impl import _disable_side_effect_safety_checks_for_current_subtracer
 
     def wrapped_fn(*args, **kwargs):
-        return _UNSAFE_allow_side_effects(fn, *args, **kwargs)
+        return _disable_side_effect_safety_checks_for_current_subtracer(fn, *args, **kwargs)
 
     prev_is_checkpoint_enabled = _is_checkpoint_enabled
     if not _is_checkpoint_enabled:
