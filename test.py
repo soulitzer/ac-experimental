@@ -84,6 +84,25 @@ class SaveRecomputePolicyTest(TestCase):
         self.assertEqual(grad_a, grad_a_ref)
         self.assertEqual(grad_b, grad_b_ref)
 
+    def test_split_with_sizes(self):
+        def fn(a, b):
+            combined = torch.cat([a.sin(), b.cos()])
+            part1, part2 = combined.split_with_sizes([1, 1], dim=0)
+            out = part1.sin() + part2.cos()
+            return out
+
+        a = torch.tensor([1.0], requires_grad=True)
+        b = torch.tensor([2.0], requires_grad=True)
+
+        with apply_ac_policy("recompute_all"):
+            out = fn(a, b)
+
+        grad_a, grad_b = torch.autograd.grad(out.sum(), (a, b))
+        grad_a_ref, grad_b_ref = torch.autograd.grad(fn(a, b).sum(), (a, b))
+
+        self.assertEqual(grad_a, grad_a_ref)
+        self.assertEqual(grad_b, grad_b_ref)
+
     def test_with_kwargs(self):
         def fn(a):
             # If the kwarg for to_copy is not preserved, we get the error:

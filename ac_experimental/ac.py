@@ -229,10 +229,10 @@ class Node:
             )
             raw_out = self.func(*new_args, **new_kwargs)
             out_tuple = tuple(raw_out) if isinstance(raw_out, (list, tuple)) else (raw_out,)
-            for t in out_tuple:
+            for i, t in enumerate(out_tuple):
                 if isinstance(t, torch.Tensor):
-                    self.out_versions[idx] = t._version
-                self.out[idx] = t
+                    self.out_versions[i] = t._version
+                self.out[i] = t
 
         out = self.out[idx]
         self.nb_users[idx] -= 1
